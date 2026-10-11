@@ -16,7 +16,7 @@ ALLOW_SPEEDTEST=0
 ROOTFS_URL="${TCPQUALITY_ROOTFS_URL:-}"
 ROOTFS_SHA256="${TCPQUALITY_ROOTFS_SHA256:-}"
 DEBIAN_SUITE="${TCPQUALITY_DEBIAN_SUITE:-bookworm}"
-ROOTFS_RELEASE_TAG="${TCPQUALITY_ROOTFS_RELEASE_TAG:-v1.latest}"
+ROOTFS_RELEASE_TAG="${TCPQUALITY_ROOTFS_RELEASE_TAG:-v1beta.latest}"
 ROOTFS_SOURCE="${TCPQUALITY_ROOTFS_SOURCE:-}"
 ROOTFS_SOURCE_ORDER="${TCPQUALITY_ROOTFS_SOURCE_ORDER:-github ibsgss}"
 ROOTFS_GITHUB_REPOSITORY="${TCPQUALITY_ROOTFS_GITHUB_REPOSITORY:-ibsgss/TcpQuality}"
@@ -132,7 +132,8 @@ configure_interactive_args() {
   answer_is_no "$answer" && upload_rank=0
 
   if [ "$run_route" -eq 0 ]; then
-    if [ "$run_edu" -eq 0 ] && [ "$run_intl" -eq 0 ] && [ "$run_speedtest" -eq 0 ]; then
+    if [ "$run_edu" -eq 0 ] && [ "$run_intl" -eq 0 ] &&
+       [ "$run_speedtest" -eq 0 ]; then
       die "未选择任何测试项目"
     fi
   fi
@@ -151,7 +152,6 @@ configure_interactive_args() {
       selected_args+=("--speedtest")
     fi
   fi
-
   if [ "$run_route" -eq 1 ] && [ "$run_edu" -eq 1 ] &&
      [ "$run_intl" -eq 1 ] && [ "$run_speedtest" -eq 1 ]; then
     selected_args=("--all")
@@ -266,7 +266,6 @@ if [ "$#" -gt 0 ]; then
 else
   echo "[i] 主脚本参数: 默认三网回程测试"
 fi
-
 for arg in "$@"; do
   case "$arg" in
     --speedtest-staged|--only-speedtest-staged)
@@ -1060,6 +1059,10 @@ resolve_tcpquality_asset() {
       return 0
     fi
   done
+  if [ -r "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
   return 1
 }
 
@@ -1204,6 +1207,7 @@ if [ "${INTERACTIVE_INCLUDE_DEFAULT_ROUTE:-0}" -eq 1 ]; then
 fi
 for env_name in \
   GET_NODES_URL TCPQUALITY_REPORT_API TCPQUALITY_RANK_SESSION_API \
+  TCPQUALITY_RAW_BASE TCPQUALITY_ASSET_BASE \
   TCPQUALITY_TCP_INFO TCPQUALITY_TCP_INFO_PRELOAD TCPQUALITY_RETRANS_TRACE \
   TCPQUALITY_RETRANS_TRACE_SCRIPT TCPQUALITY_RETRANS_TRACE_FALLBACK_SCRIPT \
   TCPQUALITY_BPFTRACE_BTF \

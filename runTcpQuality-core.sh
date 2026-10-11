@@ -104,6 +104,8 @@ UNDERLINE='\033[4m'
 NC='\033[0m'
 BG_RED='\033[41m';   BG_GREEN='\033[42m';   BG_YELLOW='\033[43m'
 
+CORE_SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 USE_SUDO=""
 IPV4_PUBLIC=""
 IPV6_PUBLIC=""
@@ -118,6 +120,7 @@ REMOTE_CDN4_NODES=()
 REMOTE_CDN6_NODES=()
 REMOTE_CERNET_NODES=()
 REMOTE_CERNET2_NODES=()
+REMOTE_TELEGRAM_DC_NODES=()
 
 # ===================== 依赖与权限检查 =====================
 init_privilege() {
@@ -385,6 +388,18 @@ INTERNATIONAL_SITE_TARGETS=(
   'Zoom API|api.zoom.us'
 )
 
+# Telegram DC 引导地址，中央 getNodes 服务暂不可用时作为客户端兜底。
+# 格式：DC 编号|IPv4|IPv6|IPv4 端口|IPv6 端口。
+INTERNATIONAL_TELEGRAM_DC_BOOTSTRAP_TARGETS=(
+  '1|149.154.175.50|2001:b28:f23d:f001::a|443|443'
+  '2|149.154.167.51|2001:67c:4e8:f002::a|443|443'
+  '3|149.154.175.100|2001:b28:f23d:f003::a|443|443'
+  '4|149.154.167.91|2001:67c:4e8:f004::a|443|443'
+  '5|149.154.171.5|2001:b28:f23f:f005::a|443|443'
+)
+INTERNATIONAL_TELEGRAM_DC_TARGETS=("${INTERNATIONAL_TELEGRAM_DC_BOOTSTRAP_TARGETS[@]}")
+INTERNATIONAL_TELEGRAM_NODES_REFRESHED=0
+
 INTERNATIONAL_CDN_TARGETS=(
   'Akamai Edge|Akamai|www.akamai.com|'
   'AWS CloudFront|CloudFront|d1.awsstatic.com|'
@@ -547,10 +562,15 @@ load_remote_nodes() {
   fi
   rm -f "$err"
 
-  REMOTE_CDN4_NODES=()
-  REMOTE_CDN6_NODES=()
-  REMOTE_CERNET_NODES=()
-  REMOTE_CERNET2_NODES=()
+  if [ "$scope" = "telegram" ]; then
+    REMOTE_TELEGRAM_DC_NODES=()
+  else
+    REMOTE_CDN4_NODES=()
+    REMOTE_CDN6_NODES=()
+    REMOTE_CERNET_NODES=()
+    REMOTE_CERNET2_NODES=()
+    REMOTE_TELEGRAM_DC_NODES=()
+  fi
 
   while IFS= read -r line; do
     line=${line//$'\t'/'|'}
@@ -563,12 +583,14 @@ load_remote_nodes() {
       cdn:6) REMOTE_CDN6_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
       cernet:4) REMOTE_CERNET_NODES+=("$prov|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-443}") ;;
       cernet2:6) REMOTE_CERNET2_NODES+=("$prov|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-443}") ;;
+      telegram:4|telegram:6) REMOTE_TELEGRAM_DC_NODES+=("$prov|$family|$ip|$port") ;;
     esac
   done < "$tmp"
   rm -f "$tmp"
 
   if [ "${#REMOTE_CDN4_NODES[@]}" -gt 0 ] || [ "${#REMOTE_CDN6_NODES[@]}" -gt 0 ] ||
-     [ "${#REMOTE_CERNET_NODES[@]}" -gt 0 ] || [ "${#REMOTE_CERNET2_NODES[@]}" -gt 0 ]; then
+     [ "${#REMOTE_CERNET_NODES[@]}" -gt 0 ] || [ "${#REMOTE_CERNET2_NODES[@]}" -gt 0 ] ||
+     [ "${#REMOTE_TELEGRAM_DC_NODES[@]}" -gt 0 ]; then
     REMOTE_NODES_LOADED=1
     return 0
   fi
@@ -584,6 +606,55 @@ require_remote_nodes() {
   echo -e "${DIM}    getNodes: ${GET_NODES_LAST_URL:-${GET_NODES_URL}}${NC}"
   [ -n "$GET_NODES_LAST_ERROR" ] && echo -e "${DIM}    curl: ${GET_NODES_LAST_ERROR}${NC}"
   exit 1
+}
+
+refresh_international_telegram_targets() {
+  [ "$INTERNATIONAL_TELEGRAM_NODES_REFRESHED" -eq 1 ] && return 0
+  INTERNATIONAL_TELEGRAM_NODES_REFRESHED=1
+  load_remote_nodes "telegram" || return 1
+
+  local entry dc_id family ip port index dynamic_count=0
+  local fallback_entry fallback_dc_id fallback_ipv4 fallback_ipv6 fallback_port4 fallback_port6
+  local ipv4 ipv6 port4 port6
+  local -a remote_ipv4=("" "" "" "" "") remote_ipv6=("" "" "" "" "")
+  local -a remote_port4=("" "" "" "" "") remote_port6=("" "" "" "" "")
+  local -a targets=()
+
+  for entry in "${REMOTE_TELEGRAM_DC_NODES[@]}"; do
+    IFS='|' read -r dc_id family ip port <<< "$entry"
+    dc_id=${dc_id#DC}
+    case "$dc_id" in 1|2|3|4|5) ;; *) continue ;; esac
+    index=$((dc_id - 1))
+    case "$family" in
+      4)
+        if [ -z "${remote_ipv4[$index]}" ]; then
+          remote_ipv4[$index]="$ip"
+          remote_port4[$index]="$port"
+          dynamic_count=$((dynamic_count + 1))
+        fi
+        ;;
+      6)
+        if [ -z "${remote_ipv6[$index]}" ]; then
+          remote_ipv6[$index]="$ip"
+          remote_port6[$index]="$port"
+          dynamic_count=$((dynamic_count + 1))
+        fi
+        ;;
+    esac
+  done
+  [ "$dynamic_count" -gt 0 ] || return 1
+
+  for fallback_entry in "${INTERNATIONAL_TELEGRAM_DC_BOOTSTRAP_TARGETS[@]}"; do
+    IFS='|' read -r fallback_dc_id fallback_ipv4 fallback_ipv6 fallback_port4 fallback_port6 <<< "$fallback_entry"
+    index=$((fallback_dc_id - 1))
+    ipv4=${remote_ipv4[$index]:-$fallback_ipv4}
+    ipv6=${remote_ipv6[$index]:-$fallback_ipv6}
+    port4=${remote_port4[$index]:-$fallback_port4}
+    port6=${remote_port6[$index]:-$fallback_port6}
+    targets+=("$fallback_dc_id|$ipv4|$ipv6|$port4|$port6")
+  done
+  INTERNATIONAL_TELEGRAM_DC_TARGETS=("${targets[@]}")
+  return 0
 }
 
 print_cdn_entries() {
@@ -644,6 +715,7 @@ NixOS:
 
 国际互联：
   CDN 目标优先使用静态资源入口；每个域名最多探测 2 个公网 IPv4，结果合并统计。
+  同时探测 Telegram DC1-DC5；地址和端口从中央 getNodes 服务拉取，自动检测可用地址族并跳过不可用地址族，服务不可用时使用内置引导地址。
   国际节点分别执行 iPerf3 上传和下载（-R）；每个方向显示 TCP RTT 与重传次数，每行最多三个节点。
   国际节点 iPerf3 默认限速 1M、测试 5 秒；每个节点/协议/方向最多尝试 10 次，成功即停止；可用 TCPQUALITY_INTERNATIONAL_IPERF_RATE/TCPQUALITY_INTERNATIONAL_IPERF_SECONDS 覆盖。
   设置 TCPQUALITY_INTERNATIONAL_MAX_IPS=1 可恢复每个域名只探测一个地址。
@@ -3270,27 +3342,28 @@ export RESULT_DIR PACKETS PACKET_SIZES PACKET_SIZE_OVERRIDE LARGE_PACKET_SIZES I
 
 # ===================== 国际互联 TCP ping =====================
 international_task_count() {
-  printf '%s' "$((${#INTERNATIONAL_SITE_TARGETS[@]} + ${#INTERNATIONAL_CDN_TARGETS[@]}))"
+  printf '%s' "$((${#INTERNATIONAL_SITE_TARGETS[@]} + ${#INTERNATIONAL_CDN_TARGETS[@]} + ${#INTERNATIONAL_TELEGRAM_DC_TARGETS[@]} * $(international_latency_family_count)))"
 }
 
 international_latency_families() {
   if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
-    printf '4\n'
+    ipv4_available && printf '4\n'
   elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
-    printf '6\n'
+    ipv6_available && printf '6\n'
   else
-    printf '4\n6\n'
+    ipv4_available && printf '4\n'
+    ipv6_available && printf '6\n'
   fi
 }
 
 international_latency_family_count() {
-  if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
-    printf '1'
-  elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
-    printf '1'
-  else
-    printf '2'
-  fi
+  local family count=0
+  while read -r family; do
+    if [ -n "$family" ]; then
+      count=$((count + 1))
+    fi
+  done < <(international_latency_families)
+  printf '%s' "$count"
 }
 
 international_latency_direction_count() {
@@ -3526,6 +3599,20 @@ international_test_one() {
     > "$outfile"
 }
 
+international_telegram_dc_test_one() {
+  local idx="$1" family="$2" dc_id="$3" target_ip="$4" port="${5:-443}"
+  local outfile="${RESULT_DIR}/internet_${idx}" result status _prov _isp _host ip sent rcv loss lat family_name
+  local PACKETS="$INTERNATIONAL_PACKETS"
+  local name="Telegram DC${dc_id}"
+  family_name="IPv${family}"
+
+  result=$(probe_target "internet" "$family" "$name" "网站" "$target_ip" "$target_ip" "$port" "$idx" "telegram-dc${dc_id}-ipv${family}")
+  IFS='|' read -r status _prov _isp _host ip sent rcv loss lat <<< "$result"
+  printf '%s|网站|%s-%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" "$name" "$family_name" "$target_ip" "$ip" "$sent" "$rcv" "$loss" "$lat" "$family" \
+    > "$outfile"
+}
+
 international_latency_test_one() {
   local idx="$1" family="$2" direction="$3" row_key="$4" region="$5" label="$6" host="$7" base_port="${8:-5201}" v6_base_port="${9:-}"
   local fallback_host="${10:-}" fallback_base_port="${11:-}"
@@ -3675,9 +3762,10 @@ international_latency_test_one() {
 }
 
 run_international_tests() {
-  local idx=0 launched=0 entry name provider domain path category total latency_expected=0
+  local idx=0 launched=0 entry name provider domain path category total latency_expected=0 dc_id dc_ipv4 dc_ipv6 dc_port4 dc_port6 target_ip target_port
   local row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port family direction
   local -a latency_families=()
+  refresh_international_telegram_targets || true
   mapfile -t latency_families < <(international_latency_families)
   total=$(international_total_task_count)
   INTERNATIONAL_PROGRESS_TOTAL="$total"
@@ -3736,6 +3824,27 @@ run_international_tests() {
       show_progress
   done
 
+  for family in "${latency_families[@]}"; do
+    for entry in "${INTERNATIONAL_TELEGRAM_DC_TARGETS[@]}"; do
+      IFS='|' read -r dc_id dc_ipv4 dc_ipv6 dc_port4 dc_port6 <<< "$entry"
+      if [ "$family" = "4" ]; then
+        target_ip="$dc_ipv4"
+        target_port="$dc_port4"
+      else
+        target_ip="$dc_ipv6"
+        target_port="$dc_port6"
+      fi
+      idx=$((idx + 1))
+      while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
+        show_progress
+        sleep 0.2
+      done
+      international_telegram_dc_test_one "$idx" "$family" "$dc_id" "$target_ip" "$target_port" &
+      launched=$((launched + 1))
+      show_progress
+    done
+  done
+
   while [ "$(count_international_progress)" -lt "$total" ]; do
     show_progress
     sleep 0.2
@@ -3745,13 +3854,14 @@ run_international_tests() {
 }
 
 append_international_csv() {
-  local csv="$1" f status category name domain ip sent rcv loss lat total i
+  local csv="$1" f status category name domain ip sent rcv loss lat family total i
   total=$(international_task_count)
   for ((i = 1; i <= total; i++)); do
     f="${RESULT_DIR}/internet_${i}"
     [ -f "$f" ] || continue
-    IFS='|' read -r status category name domain ip sent rcv loss lat < "$f"
-    echo "国际互联,IPv4,$name,$category,$domain,$ip,$status,$sent,$rcv,$loss,$lat,TCP443" >> "$csv"
+    IFS='|' read -r status category name domain ip sent rcv loss lat family < "$f"
+    family=${family:-4}
+    echo "国际互联,IPv${family},$name,$category,$domain,$ip,$status,$sent,$rcv,$loss,$lat,TCP443" >> "$csv"
   done
 }
 
@@ -4015,7 +4125,19 @@ run_international_mode() {
   require_raw_socket_privilege
   check_curl
   check_nping
-  echo -e "${DIM}  国际互联网站/CDN: $(international_task_count)  延迟方向: ${#INTERNATIONAL_IPERF_TARGETS[@]}×$(international_latency_family_count)×2（上传/下载）  并行: $PARALLEL  端口: 443/tcp、iPerf3 ${INTERNATIONAL_IPERF_RATE}/${INTERNATIONAL_IPERF_SECONDS}s，失败最多重试 ${INTERNATIONAL_IPERF_MAX_ATTEMPTS} 次（目标可单独指定）${NC}"
+  detect_ip_stack
+  refresh_international_telegram_targets || true
+  if ipv4_available; then
+    echo -e "$GREEN[√] 国际互联检测到可用 IPv4$NC"
+  else
+    echo -e "$YELLOW[!] 国际互联未检测到可用 IPv4，跳过 DC IPv4 探测$NC"
+  fi
+  if ipv6_available; then
+    echo -e "$GREEN[√] 国际互联检测到可用 IPv6$NC"
+  else
+    echo -e "$YELLOW[!] 国际互联未检测到可用 IPv6，跳过 IPv6 探测$NC"
+  fi
+  echo -e "${DIM}  国际互联探测${NC}"
   echo
   MULTI_PROGRESS_MODE=1
   TOTAL=0
@@ -4304,7 +4426,11 @@ load_remote_applecdn6_nodes() {
     [ "$family" = "6" ] || continue
     [ "$isp" = "移动" ] || continue
     is_valid_ipv6 "$ip" || continue
-    label="${prov}${isp}"
+    case "$prov" in
+      深圳) label="深圳移动" ;;
+      重庆) label="重庆移动" ;;
+      *) continue ;;
+    esac
     local_index=0
     for existing in "${SPEEDTEST_APPLECDN6_NODES[@]}"; do
       existing_label=${existing%%|*}
@@ -5982,6 +6108,17 @@ speedtest_metric_failed() {
   esac
 }
 
+speedtest_metric_unavailable() {
+  case "${1,,}" in
+    ""|-)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 speedtest_speed_text() {
   local value="$1"
   if speedtest_metric_failed "$value"; then
@@ -6093,6 +6230,15 @@ speedtest_retrans_color() {
   else
     printf '%s' "$GREEN"
   fi
+}
+
+speedtest_add_ipv6_unavailable_row() {
+  local row label
+  for row in "${SPEEDTEST_ROWS[@]}"; do
+    IFS=';' read -r label _ <<<"$row"
+    [ "$label" = "IPv6" ] && return 0
+  done
+  SPEEDTEST_ROWS+=("IPv6;-|-|-||深圳移动|-|-|-|-;-|-|-||重庆移动|-|-|-|-")
 }
 
 collect_speedtest_results() {
@@ -6222,6 +6368,8 @@ collect_speedtest_results() {
       speedtest_collect_applecdn6
       done=$((done + apple_ipv6_steps))
       speedtest_show_progress "$done" "$total"
+    elif speedtest_applecdn6_tests_enabled; then
+      speedtest_add_ipv6_unavailable_row
     fi
     speedtest_collect_applecdn
     done=$((done + apple_steps))
@@ -6273,7 +6421,11 @@ speedtest_set_failed_rows() {
         node_candidates="${node#*|}"
         ipv6_values+=("failed|failed|failed|${node_candidates%%|*}|$node_label|-|-|-|-")
       done
-      [ "${#ipv6_values[@]}" -gt 0 ] && SPEEDTEST_ROWS+=("IPv6;${ipv6_values[0]};${ipv6_values[1]};")
+      if [ "${#ipv6_values[@]}" -gt 0 ]; then
+        SPEEDTEST_ROWS+=("IPv6;${ipv6_values[0]};${ipv6_values[1]};")
+      else
+        speedtest_add_ipv6_unavailable_row
+      fi
     fi
     apple_row="AppleCDN;failed|failed|failed|$SPEEDTEST_APPLECDN_HOST|Apple IPv4|-|-|-|-"
     if speedtest_applecdn6_tests_enabled; then
@@ -6319,6 +6471,7 @@ speedtest_load_background_state() {
   done < "$SPEEDTEST_STATE_FILE"
 
   [ "${#SPEEDTEST_ROWS[@]}" -gt 0 ] || speedtest_set_failed_rows
+  speedtest_applecdn6_tests_enabled && speedtest_add_ipv6_unavailable_row
 }
 
 start_speedtest_background() {
@@ -6359,7 +6512,7 @@ wait_speedtest_background() {
 }
 
 show_speedtest_results() {
-  local row label result1 result2 result3 result upload retrans download server_id city upload_connect upload_tls download_connect download_tls index carrier region upload_text download_text upload_tls_text download_tls_text
+  local row label result1 result2 result3 result upload retrans download server_id city upload_connect upload_tls download_connect download_tls index carrier region retrans_text upload_text download_text upload_tls_text download_tls_text
   local speed_color retrans_color tls_color
   local carriers=(电信 联通 移动)
   local results=()
@@ -6459,7 +6612,7 @@ show_speedtest_results() {
       carrier="${carriers[$index]}"
       IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
       if [ "$label" = "IPv6" ]; then
-        region="${city:-$carrier}"
+        region="$carrier"
       else
         region="${city:-$(speedtest_selected_city "$carrier")}${carrier}"
         [ -n "${city:-$(speedtest_selected_city "$carrier")}" ] || region="${carrier}失败"
@@ -6467,30 +6620,56 @@ show_speedtest_results() {
       printf '  '
       printf '%b' "$CYAN"; speedtest_pad_left 12 "$region"; printf '%b' "$NC"
       printf '  '
-      retrans_color=$(speedtest_retrans_color "$retrans")
-      printf '%b' "$retrans_color"; speedtest_pad_left 10 "$retrans"; printf '%b' "$NC"
+      if [ "$label" = "IPv6" ] && speedtest_metric_unavailable "$retrans"; then
+        retrans_text="-"
+        retrans_color="$DIM"
+      else
+        retrans_text="$retrans"
+        retrans_color=$(speedtest_retrans_color "$retrans")
+      fi
+      printf '%b' "$retrans_color"; speedtest_pad_left 10 "$retrans_text"; printf '%b' "$NC"
       printf '  '
-      upload_text=$(speedtest_speed_text "$upload")
-      speed_color=$(speedtest_speed_color "$upload" "$label")
+      if [ "$label" = "IPv6" ] && speedtest_metric_unavailable "$upload"; then
+        upload_text="-"
+        speed_color="$DIM"
+      else
+        upload_text=$(speedtest_speed_text "$upload")
+        speed_color=$(speedtest_speed_color "$upload" "$label")
+      fi
       printf '%b' "$speed_color"; speedtest_pad_left 12 "$upload_text"; printf '%b' "$NC"
       printf '  '
-      download_text=$(speedtest_speed_text "$download")
-      speed_color=$(speedtest_speed_color "$download" "$label")
+      if [ "$label" = "IPv6" ] && speedtest_metric_unavailable "$download"; then
+        download_text="-"
+        speed_color="$DIM"
+      else
+        download_text=$(speedtest_speed_text "$download")
+        speed_color=$(speedtest_speed_color "$download" "$label")
+      fi
       printf '%b' "$speed_color"; speedtest_pad_left 12 "$download_text"; printf '%b' "$NC"
       printf '  '
-      upload_tls_text=$(speedtest_direction_latency_text "$upload_tls" "$upload")
-      if speedtest_metric_failed "$upload"; then
-        tls_color="$RED"
+      if [ "$label" = "IPv6" ] && speedtest_metric_unavailable "$upload"; then
+        upload_tls_text="-"
+        tls_color="$DIM"
       else
-        tls_color=$(speedtest_latency_color "$upload_tls")
+        upload_tls_text=$(speedtest_direction_latency_text "$upload_tls" "$upload")
+        if speedtest_metric_failed "$upload"; then
+          tls_color="$RED"
+        else
+          tls_color=$(speedtest_latency_color "$upload_tls")
+        fi
       fi
       printf '%b' "$tls_color"; speedtest_pad_left 10 "$upload_tls_text"; printf '%b' "$NC"
       printf '  '
-      download_tls_text=$(speedtest_direction_latency_text "$download_tls" "$download")
-      if speedtest_metric_failed "$download"; then
-        tls_color="$RED"
+      if [ "$label" = "IPv6" ] && speedtest_metric_unavailable "$download"; then
+        download_tls_text="-"
+        tls_color="$DIM"
       else
-        tls_color=$(speedtest_latency_color "$download_tls")
+        download_tls_text=$(speedtest_direction_latency_text "$download_tls" "$download")
+        if speedtest_metric_failed "$download"; then
+          tls_color="$RED"
+        else
+          tls_color=$(speedtest_latency_color "$download_tls")
+        fi
       fi
       printf '%b' "$tls_color"; speedtest_pad_left 10 "$download_tls_text"; printf '%b' "$NC"
       printf '\n'
@@ -6510,7 +6689,11 @@ append_speedtest_csv() {
         [ -n "$result" ] || continue
         IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
         city="${city:-IPv6}"
-        if [ "$upload" = "failed" ] || [ "$download" = "failed" ]; then
+        if [ "$upload" = "-" ] && [ "$download" = "-" ]; then
+          printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "$city" "$city" "SKIP" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        elif [ "$upload" = "failed" ] || [ "$download" = "failed" ]; then
           printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
             "$label" "$city" "$city" "FAIL" "$upload" "$retrans" "$download" \
             "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"

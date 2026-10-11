@@ -52,6 +52,7 @@ curl -fsSL https://tcpquality.ibsgss.uk/run | env TERM=xterm bash
 - `--speedtest`：完成 TCP 质量探测后，追加单线程测速。
 - `--only-speedtest`：仅运行单线程测速。
 - `--intl`：单独使用时仅运行国际互联；与 `-v4`、`-v6`、`--all` 等组合时追加国际互联。
+- 国际互联探测包含 Telegram DC1–DC5；地址和端口从中央 `getNodes` 服务获取，中央服务每 5 分钟刷新一次，自动检测可用 IPv4/IPv6 并跳过不可用地址族。服务不可用时使用内置引导地址兜底。
 - `--province CODE`：仅检测指定省份，可重复；也支持 `-bj`、`-sh`、`-gd` 等省份简写。
 - `--debug`：保留临时文件并输出调试信息。
 
