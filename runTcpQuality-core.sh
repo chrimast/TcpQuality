@@ -87,6 +87,7 @@ bootstrap_nixos_environment() {
           "LANG=${LANG:-C.UTF-8}" \
           "GET_NODES_URL=${GET_NODES_URL:-}" \
           "TCPQUALITY_REPORT_API=${TCPQUALITY_REPORT_API:-}" \
+          "TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS=${TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS:-}" \
           TCPQUALITY_NIX_BOOTSTRAPPED=1 \
           "TCPQUALITY_NIX_TEMP_SCRIPT=$1" \
           NIXPKGS_ALLOW_UNFREE=1 \
@@ -309,6 +310,13 @@ INTERNATIONAL_IPERF_SECONDS="${TCPQUALITY_INTERNATIONAL_IPERF_SECONDS:-5}"
 INTERNATIONAL_IPERF_RATE="${TCPQUALITY_INTERNATIONAL_IPERF_RATE:-1M}"
 INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS="${TCPQUALITY_INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS:-5000}"
 INTERNATIONAL_IPERF_MAX_ATTEMPTS=10
+INTERNATIONAL_IPERF_BUDGET_SECONDS="${TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS:-45}"
+if [[ "$INTERNATIONAL_IPERF_BUDGET_SECONDS" =~ ^[0-9]{1,3}$ ]] &&
+   (( 10#$INTERNATIONAL_IPERF_BUDGET_SECONDS >= 1 && 10#$INTERNATIONAL_IPERF_BUDGET_SECONDS <= 600 )); then
+  INTERNATIONAL_IPERF_BUDGET_SECONDS=$((10#$INTERNATIONAL_IPERF_BUDGET_SECONDS))
+else
+  INTERNATIONAL_IPERF_BUDGET_SECONDS=45
+fi
 SPEEDTEST_STATE_FILE=""
 SPEEDTEST_PROGRESS_FILE=""
 SPEEDTEST_BACKGROUND=0
@@ -320,6 +328,7 @@ PROGRESS_LINES_PRINTED=0
 PROGRESS_LAST_STATE=""
 PROGRESS_LAST_TS=0
 PROGRESS_MIN_INTERVAL=1
+PROGRESS_LAST_SCAN_SECOND=-1
 REPORT_API=${TCPQUALITY_REPORT_API:-https://tcpquality.ibsgss.uk/generate}
 ROUTE_ASN_API=${TCPQUALITY_ROUTE_ASN_API:-${REPORT_API%/generate}/route/asn?format=tsv}
 RANK_SESSION_API=${TCPQUALITY_RANK_SESSION_API:-${REPORT_API%/generate}/rank/session}
@@ -328,8 +337,10 @@ RANK_SESSION_TOKEN=""
 RANK_SESSION_STARTED_AT=""
 RANK_SESSION_EXPIRES_AT=""
 RANK_SESSION_IP4=""
-RESULT_DIR=$(mktemp -d)
+RESULTS_INCOMPLETE=0
+RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-results.XXXXXX")
 cleanup_result_dir() {
+  local exit_status=$?
   printf '%b' "${NC:-\033[0m}"
   if [ "${DEBUG_MODE:-0}" -eq 1 ]; then
     local archive="${RESULT_DIR}.tar.gz"
@@ -339,6 +350,8 @@ cleanup_result_dir() {
     else
       echo -e "${YELLOW}[!] Debug 打包失败：$RESULT_DIR${NC}"
     fi
+  elif [ "$exit_status" -ne 0 ] || [ "${RESULTS_INCOMPLETE:-0}" -eq 1 ]; then
+    echo -e "${YELLOW}[!] 测试未完成，中间结果已保留：$RESULT_DIR${NC}" >&2
   else
     rm -rf "$RESULT_DIR"
   fi
@@ -696,7 +709,8 @@ NixOS:
   -s, --size NUM    指定 IP 包总长度（单位 B），0 为标准无负载 SYN；默认 0
                      小于协议头部的数值按最小头部长度发送
   -p, --parallel NUM
-                     设置并行节点数，范围 1-31，默认按内存自动选择
+                     设置并行节点数上限，范围 1-31，默认按可用内存自动选择
+                     低内存时也会调低手动设置的上限
   -v4, --v4         仅探测 IPv4
   -v6, --v6         仅探测 IPv6
   --only-large      仅探测 IPv4大包回程
@@ -717,7 +731,7 @@ NixOS:
   CDN 目标优先使用静态资源入口；每个域名最多探测 2 个公网 IPv4，结果合并统计。
   同时探测 Telegram DC1-DC5；地址和端口从中央 getNodes 服务拉取，自动检测可用地址族并跳过不可用地址族，服务不可用时使用内置引导地址。
   国际节点分别执行 iPerf3 上传和下载（-R）；每个方向显示 TCP RTT 与重传次数，每行最多三个节点。
-  国际节点 iPerf3 默认限速 1M、测试 5 秒；每个节点/协议/方向最多尝试 10 次，成功即停止；可用 TCPQUALITY_INTERNATIONAL_IPERF_RATE/TCPQUALITY_INTERNATIONAL_IPERF_SECONDS 覆盖。
+  国际节点 iPerf3 默认限速 1M、测试 5 秒；每个节点/协议/方向最多尝试 10 次，默认尝试预算 45 秒（含备用节点），成功即停止；可用 TCPQUALITY_INTERNATIONAL_IPERF_RATE/TCPQUALITY_INTERNATIONAL_IPERF_SECONDS/TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS 覆盖。
   设置 TCPQUALITY_INTERNATIONAL_MAX_IPS=1 可恢复每个域名只探测一个地址。
   --debug 还会保存国际互联目标的候选 IP、HTTP 状态、边缘和缓存信息。
 
@@ -892,35 +906,156 @@ parse_args() {
   fi
 }
 
+# /proc/meminfo may describe the host rather than this container. Resolve the
+# process's memory cgroup from mountinfo (including bind mounts/chroots), then
+# apply every visible ancestor limit. Swap is deliberately not a worker budget.
+detect_memory_mb() {
+  local proc_dir="${1:-/proc}" total_kb available_kb
+  local root mount_point version cgroup_path relative dir limit usage values
+  read -r total_kb available_kb < <(awk '
+    /^MemTotal:/ {total=$2}
+    /^MemAvailable:/ {available=$2; found=1}
+    END {if (total > 0) print total, (found ? available : total)}
+  ' "$proc_dir/meminfo" 2>/dev/null || true)
+  if ! [[ "$total_kb" =~ ^[0-9]+$ ]] || [ "$total_kb" -le 0 ]; then
+    total_kb=524288
+  fi
+  [[ "$available_kb" =~ ^[0-9]+$ ]] || available_kb="$total_kb"
+  [ "$available_kb" -le "$total_kb" ] || available_kb="$total_kb"
+
+  if [ -r "$proc_dir/self/cgroup" ] && [ -r "$proc_dir/self/mountinfo" ]; then
+    while IFS=$'\t' read -r root mount_point version; do
+      root=$(printf '%b' "$root")
+      mount_point=$(printf '%b' "$mount_point")
+      cgroup_path=$(awk -F: -v version="$version" '
+        version == "cgroup2" && $1 == "0" {print $3; exit}
+        version == "cgroup" && ("," $2 ",") ~ /,memory,/ {print $3; exit}
+      ' "$proc_dir/self/cgroup")
+      [ -n "$cgroup_path" ] || continue
+      if [ "$cgroup_path" = / ] || [ "$cgroup_path" = "$root" ]; then
+        relative=""
+      elif [ "$root" = / ]; then
+        relative="$cgroup_path"
+      elif [[ "$cgroup_path" == "$root/"* ]]; then
+        relative=${cgroup_path#"$root"}
+      else
+        continue
+      fi
+      dir="${mount_point%/}$relative"
+      while :; do
+        limit=""; usage=""
+        if [ "$version" = cgroup2 ]; then
+          [ ! -r "$dir/memory.max" ] || read -r limit < "$dir/memory.max" || true
+          [ ! -r "$dir/memory.current" ] || read -r usage < "$dir/memory.current" || true
+        else
+          [ ! -r "$dir/memory.limit_in_bytes" ] || read -r limit < "$dir/memory.limit_in_bytes" || true
+          [ ! -r "$dir/memory.usage_in_bytes" ] || read -r usage < "$dir/memory.usage_in_bytes" || true
+        fi
+        # Use awk for byte values: v1's unlimited sentinel can exceed signed
+        # shell arithmetic. Ignore 'max', malformed and unlimited values.
+        if [[ "$limit" =~ ^[0-9]+$ ]]; then
+          values=$(awk -v total="$total_kb" -v available="$available_kb" \
+            -v limit="$limit" -v usage="$usage" 'BEGIN {
+              limit=int(limit/1024)
+              if (limit < total) total=limit
+              if (usage ~ /^[0-9]+$/) {
+                headroom=limit-int(usage/1024)
+                if (headroom < 0) headroom=0
+                if (headroom < available) available=headroom
+              }
+              if (total < available) available=total
+              printf "%.0f %.0f\n", total, available
+            }')
+          read -r total_kb available_kb <<< "$values"
+        fi
+        [ "$dir" != "$mount_point" ] && [ "$dir" != / ] || break
+        dir=${dir%/*}
+        [ -n "$dir" ] || dir=/
+      done
+    done < <(awk '
+      {for (i=7; i<=NF; i++) if ($i == "-") {
+        if ($(i+1) == "cgroup2" ||
+            ($(i+1) == "cgroup" && ("," $(i+3) ",") ~ /,memory,/))
+          printf "%s\t%s\t%s\n", $4, $5, $(i+1)
+        break
+      }}
+    ' "$proc_dir/self/mountinfo")
+  fi
+  printf '%s %s\n' "$((total_kb / 1024))" "$((available_kb / 1024))"
+}
+
 detect_total_memory_mb() {
-  local mem_kb=""
-  if [ -r /proc/meminfo ]; then
-    mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
-    if [[ "$mem_kb" =~ ^[0-9]+$ ]] && [ "$mem_kb" -gt 0 ]; then
-      echo $((mem_kb / 1024))
-      return
-    fi
-  fi
-  if command -v free >/dev/null 2>&1; then
-    free -m 2>/dev/null | awk '/^Mem:/ {print $2; exit}'
-    return
-  fi
-  echo 512
+  local total available
+  read -r total available < <(detect_memory_mb)
+  echo "$total"
 }
 
 auto_parallel_by_memory() {
-  local mem_mb parallel
-  mem_mb=$(detect_total_memory_mb)
-  [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=512
-  parallel=$(((mem_mb + 47) / 48))
-  [ "$parallel" -lt 1 ] && parallel=1
-  [ "$parallel" -gt 93 ] && parallel=93
+  local total available parallel
+  read -r total available < <(detect_memory_mb)
+  # Keep 64 MiB for the shell, progress/reporting, SSH and other services;
+  # budget 16 MiB per node, rounding down rather than overcommitting.
+  parallel=$(((available - 64) / 16))
+  [ "$parallel" -ge 1 ] || parallel=1
+  [ "$parallel" -le 31 ] || parallel=31
   echo "$parallel"
 }
 
 apply_auto_parallel() {
-  [ "$PARALLEL_EXPLICIT" -eq 1 ] && return
-  PARALLEL=$(auto_parallel_by_memory)
+  local safe_parallel
+  safe_parallel=$(auto_parallel_by_memory)
+  if [ "$PARALLEL_EXPLICIT" -eq 1 ]; then
+    if [ "$PARALLEL" -gt "$safe_parallel" ]; then
+      echo -e "${YELLOW}[!] 可用内存较低，并行节点数从 $PARALLEL 调整为 $safe_parallel${NC}" >&2
+      PARALLEL="$safe_parallel"
+    fi
+  else
+    PARALLEL="$safe_parallel"
+  fi
+  return 0
+}
+
+# A worker can exit without producing a result (e.g. OOM/signal). Count live
+# jobs rather than result files, and wake as soon as any worker finishes.
+wait_for_one_worker() {
+  if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) )); then
+    wait -n || true
+  else
+    sleep 0.2
+  fi
+}
+
+wait_for_worker_slot() {
+  local limit="${1:-$PARALLEL}" show="${2:-1}" running
+  local -a workers=()
+  while :; do
+    running=$(jobs -pr)
+    [ -n "$running" ] || return 0
+    read -r -a workers <<< "${running//$'\n'/ }"
+    [ "${#workers[@]}" -ge "$limit" ] || return 0
+    [ "$show" -eq 0 ] || show_progress
+    wait_for_one_worker
+  done
+}
+
+wait_for_workers() {
+  local show="${1:-1}" running
+  while :; do
+    running=$(jobs -pr)
+    [ -n "$running" ] || break
+    [ "$show" -eq 0 ] || show_progress
+    wait_for_one_worker
+  done
+  wait
+}
+
+check_worker_results() {
+  local actual="$1" expected="$2" section="$3"
+  if [ "$actual" -lt "$expected" ]; then
+    RESULTS_INCOMPLETE=1
+    echo -e "${YELLOW}[!] $section 部分任务异常退出（结果 $actual/$expected），将保留中间结果${NC}" >&2
+  fi
+  return 0
 }
 
 # ===================== 工具函数 =====================
@@ -985,7 +1120,7 @@ show_single_progress() {
 }
 
 count_route_progress() {
-  find "$RESULT_DIR" -maxdepth 1 -type f \( -name 'summary_route[46]_[0-9]*' -o -name 'summary_large_route4_[0-9]*' \) ! -name '*.ips' 2>/dev/null | wc -l | tr -d ' '
+  find "$RESULT_DIR" -maxdepth 1 -type f \( -name 'summary_route[46]_[0-9]*' -o -name 'summary_large_route4_[0-9]*' -o -name 'edu_route[46]_[0-9]*' \) ! -name '*.ips' 2>/dev/null | wc -l | tr -d ' '
 }
 
 count_international_progress() {
@@ -1073,6 +1208,10 @@ show_all_progress() {
 
 show_progress() {
   local force=${1:-0}
+  if [ "$force" -ne 1 ] && [ "$PROGRESS_LAST_SCAN_SECOND" -eq "$SECONDS" ]; then
+    return 0
+  fi
+  PROGRESS_LAST_SCAN_SECOND=$SECONDS
   if [ "${MULTI_PROGRESS_MODE:-0}" -eq 1 ]; then
     show_all_progress "$force"
   else
@@ -1528,6 +1667,9 @@ print_header() {
   terminal_link "ibsgss" "https://t.me/ibsgss"
   printf " | 感谢 Zstatic CDN 节点%b\n" "$NC"
   echo -e "${DIM}------------------------------------------------------------${NC}"
+  local node_parallel="$PARALLEL"
+  [ "$SPEEDTEST_ONLY" -ne 1 ] || node_parallel=1
+  echo -e "${DIM}当前并行节点数：${node_parallel}${NC}"
 }
 
 # 返回“出口网卡|源IPv6|源MAC|下一跳MAC”。
@@ -1825,12 +1967,42 @@ upload_probe_debug_bundle() {
   rm -f "$bundle" "$list_file" "$response_file"
 }
 
+report_upload_error_text() {
+  # Remote messages must not emit terminal controls or flood the TUI.
+  LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' |
+    tr '\r\n' '  ' | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-240
+}
+
+show_report_upload_failure() {
+  local csv="$1" http_code="${2:-000}" curl_status="$3" curl_err="$4" response_file="$5" reason=""
+  if [ "$curl_status" -ne 0 ]; then
+    echo -e "  ${YELLOW}[!] SVG 报告上传失败（curl $curl_status），本地 CSV 已保留${NC}"
+    reason=$(report_upload_error_text < "$curl_err")
+  else
+    echo -e "  ${YELLOW}[!] SVG 报告上传失败（HTTP $http_code），本地 CSV 已保留${NC}"
+    reason=$(sed -nE 's/.*"(error|message)"[[:space:]]*:[[:space:]]*"([^"]+)".*/\2/p' "$response_file" |
+      head -1 | report_upload_error_text)
+    if [ -z "$reason" ] && [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+      reason="接口响应未包含有效报告链接"
+    fi
+  fi
+  printf '    上传接口：%s\n' "$REPORT_API"
+  [ -z "$reason" ] || printf '    原因：%s\n' "$reason"
+  printf '    本地 CSV：%s\n' "$csv"
+  return 0
+}
+
 upload_report() {
-  local csv="$1" report_time="${2:-}" response_file curl_err http_code report_id report_url today_uses total_uses rank_updated rank_reject_reason rank_finished_at
+  local csv="$1" report_time="${2:-}" response_file curl_err http_code curl_status=0 report_id report_url today_uses total_uses rank_updated rank_reject_reason rank_finished_at
   local rank_headers=()
   if ! command -v curl &>/dev/null; then
     echo -e "  ${YELLOW}[!] 依赖不完整，已跳过 SVG 报告上传${NC}"
     return
+  fi
+  if [ ! -f "$csv" ] || [ ! -r "$csv" ]; then
+    echo -e "  ${YELLOW}[!] 本地 CSV 文件无法读取，已跳过 SVG 报告上传${NC}"
+    printf '    本地 CSV：%s\n' "$csv"
+    return 0
   fi
   if grep -qE '^(Speedtest|三网单线程速度),' "$csv" 2>/dev/null; then
     ensure_public_ips_for_rank
@@ -1852,7 +2024,7 @@ upload_report() {
     cp "$csv" "$RESULT_DIR/report_upload.csv" 2>/dev/null || true
   fi
   rank_finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  if ! http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
+  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
     -o "$response_file" -w '%{http_code}' \
     -H 'Content-Type: text/csv; charset=utf-8' \
     -H "X-Report-Time: $report_time" \
@@ -1861,16 +2033,19 @@ upload_report() {
     -H "X-TcpQuality-Rank-Finished-At: $rank_finished_at" \
     "${rank_headers[@]}" \
     --data-binary "@$csv" "$REPORT_API" 2>"$curl_err"); then
-    echo -e "  ${YELLOW}[!] SVG 报告上传失败，本地 CSV 已保留${NC}"
+    curl_status=0
+  else
+    curl_status=$?
+    show_report_upload_failure "$csv" "$http_code" "$curl_status" "$curl_err" "$response_file"
     if [ "$DEBUG_MODE" -eq 1 ]; then
       cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
       cp "$curl_err" "$RESULT_DIR/report_upload_curl.err" 2>/dev/null || true
-      printf '%s\n' "curl_failed" > "$RESULT_DIR/report_upload_http_code.txt"
+      printf '%s\n' "${http_code:-000}" > "$RESULT_DIR/report_upload_http_code.txt"
+      printf '%s\n' "$curl_status" > "$RESULT_DIR/report_upload_curl_status.txt"
     fi
     rm -f "$response_file" "$curl_err"
     return
   fi
-  rm -f "$curl_err"
   if [ "$DEBUG_MODE" -eq 1 ]; then
     cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
     printf '%s\n' "$http_code" > "$RESULT_DIR/report_upload_http_code.txt"
@@ -1898,9 +2073,9 @@ upload_report() {
       echo -e "  ${YELLOW}[!] 排名未更新：${rank_reject_reason}${NC}"
     fi
   else
-    echo -e "  ${YELLOW}[!] SVG 报告上传失败（HTTP $http_code），本地 CSV 已保留${NC}"
+    show_report_upload_failure "$csv" "$http_code" 0 "$curl_err" "$response_file"
   fi
-  rm -f "$response_file"
+  rm -f "$response_file" "$curl_err"
 }
 
 # ===================== 三网回程线路识别 =====================
@@ -2722,21 +2897,14 @@ run_route_mode() {
     while IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port; do
       province_selected "$prov" || continue
       idx=$((idx + 1))
-      while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$route_parallel" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot "$route_parallel"
       port=${port:-80}
       route_trace_one "$family" "$protocol" "$prov" "$isp" "$host" "$idx" "$port" "$fixed_ip" "$prefix" &
       show_progress
     done < <(print_cdn_entries "$family")
   done
-  while [ "$(jobs -pr | wc -l | tr -d ' ')" -gt 0 ]; do
-    show_progress
-    sleep 0.2
-  done
-  wait
-  show_progress
+  wait_for_workers
+  show_progress 1
   echo ""
 
   route_raw_file=$(mktemp)
@@ -2802,12 +2970,10 @@ collect_route_labels() {
     province_selected "$prov" || continue
     port=${port:-80}
     idx=$((idx + 1))
-    while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$route_parallel" ]; do
-      sleep 0.2
-    done
+    wait_for_worker_slot "$route_parallel" 0
     route_trace_one "$family" "$route_protocol" "$prov" "$isp" "$host" "$idx" "$port" "$fixed_ip" "$prefix" "$packet_length" &
   done < <(print_cdn_entries "$family")
-  wait
+  wait_for_workers 0
 
   route_raw_file=$(mktemp)
   ip_file=$(mktemp)
@@ -2867,9 +3033,7 @@ collect_education_route_labels() {
       province_selected "$prov" || continue
       port=${port:-80}
       idx=$((idx + 1))
-      while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$route_parallel" ]; do
-        sleep 0.2
-      done
+      wait_for_worker_slot "$route_parallel" 0
       route_trace_one "$family" tcp "$prov" "教育网" "$host" "$idx" "$port" "$fixed_ip" "$prefix" &
     done < <(print_cernet2_entries)
   else
@@ -2877,13 +3041,11 @@ collect_education_route_labels() {
       province_selected "$prov" || continue
       port=${port:-80}
       idx=$((idx + 1))
-      while [ "$(jobs -pr | wc -l | tr -d ' ')" -ge "$route_parallel" ]; do
-        sleep 0.2
-      done
+      wait_for_worker_slot "$route_parallel" 0
       route_trace_one "$family" tcp "$prov" "教育网" "$host" "$idx" "$port" "$fixed_ip" "$prefix" &
     done < <(print_cernet_entries)
   fi
-  wait
+  wait_for_workers 0
 
   route_raw_file=$(mktemp)
   ip_file=$(mktemp)
@@ -2971,11 +3133,12 @@ wait_route_background() {
   [ -n "${ROUTE_BACKGROUND_PID:-}" ] || return 0
   while kill -0 "$ROUTE_BACKGROUND_PID" 2>/dev/null; do
     if [ "${MULTI_PROGRESS_MODE:-0}" -eq 1 ]; then
-      show_all_progress
+      show_progress
     fi
     sleep 0.2
   done
   wait "$ROUTE_BACKGROUND_PID" 2>/dev/null || true
+  check_worker_results "$(count_route_progress)" "$ROUTE_PROGRESS_TOTAL" 回程识别
 }
 
 export -f route_trace_one
@@ -2994,8 +3157,8 @@ export -f nping_random_source_port
 export -f nping_random_seq
 
 nping_matching_min_rtt() {
-  local raw="$1"
-  printf "%s\n" "$raw" | awk '
+  local raw="$1" expected_seq="${2:-}" payload_size="${3:-0}"
+  printf "%s\n" "$raw" | awk -v expected_seq="$expected_seq" -v payload_size="$payload_size" '
     function ep_ip(ep) {
       sub(/:[0-9]+$/, "", ep)
       return tolower(ep)
@@ -3006,14 +3169,24 @@ nping_matching_min_rtt() {
       }
       return ""
     }
-    function parse_tcp_line(line, prefix, time_s, body, parts, left, right) {
+    function parse_tcp_line(line, prefix, time_s, body, parts, left, right, fields, ack) {
       time_s = line
       sub(/^[^(]*\(/, "", time_s)
       sub(/s\).*/, "", time_s)
       body = line
       sub(/^.* TCP /, "", body)
+      sub(/^\[/, "", body)
       split(body, parts, " > ")
       if (!parts[1] || !parts[2]) return 0
+      # Verbose Nping includes ACK; validate it when the caller knows the SYN
+      # sequence, so a late reply to an earlier probe cannot be counted.
+      if (prefix == "rcvd" && expected_seq != "" && line ~ / TCP \[/) {
+        split(parts[2], fields, /[[:space:]]+/)
+        if (index(fields[2], "A") == 0 || !match(line, / ack=[0-9]+/)) return 0
+        ack = substr(line, RSTART + 5, RLENGTH - 5) + 0
+        if (ack != (expected_seq + 1) % 4294967296 &&
+            ack != (expected_seq + 1 + payload_size) % 4294967296) return 0
+      }
       left = parts[1]
       right = parts[2]
       sub(/ .*/, "", right)
@@ -3059,6 +3232,50 @@ nping_matching_min_rtt() {
 }
 
 export -f nping_matching_min_rtt
+
+# Keep nping's normal timeout unless both the TCP tuple and ACK match. Without
+# stdbuf retain the original path; ambiguous replies also wait normally.
+nping_early_probe() {
+  if ! command -v stdbuf >/dev/null 2>&1; then
+    nping "$@"
+    return $?
+  fi
+  local line sent_line="" sent_seq="" ack="" flags="" pid fd stopped=0 rc=0
+  coproc NPING_EARLY { exec stdbuf -oL nping -v2 "$@" 2>&1; }
+  pid=$NPING_EARLY_PID
+  # Bash closes the coprocess descriptor when it reaps a fast child. Keep a
+  # duplicate open so buffered response and summary lines remain readable.
+  exec {fd}<&"${NPING_EARLY[0]}"
+  while IFS= read -r line <&"$fd"; do
+    printf '%s\n' "$line"
+    case "$line" in
+      SENT*' TCP '*)
+        if [ -z "$sent_line" ]; then
+          sent_line="$line"
+          if [[ "$line" =~ [[:space:]]seq=([0-9]+) ]]; then sent_seq=${BASH_REMATCH[1]}; fi
+        fi
+        ;;
+      RCVD*' TCP '*)
+        ack=""
+        flags=""
+        if [[ "$line" =~ [[:space:]]([A-Z]+)[[:space:]]seq= ]]; then flags=${BASH_REMATCH[1]}; fi
+        if [[ "$line" =~ [[:space:]]ack=([0-9]+) ]]; then ack=${BASH_REMATCH[1]}; fi
+        if [ "$stopped" -eq 0 ] && [[ "$flags" == *A* ]] && [ -n "$sent_seq" ] && [ -n "$ack" ] &&
+           [ "$ack" -eq $(((sent_seq + 1) & 0xffffffff)) ] &&
+           nping_matching_min_rtt "$sent_line
+$line" "$sent_seq" 0 >/dev/null; then
+          if kill -INT "$pid" 2>/dev/null; then stopped=1; fi
+        fi
+        ;;
+    esac
+  done
+  exec {fd}<&-
+  wait "$pid" || rc=$?
+  [ "$stopped" -eq 0 ] || return 0
+  return "$rc"
+}
+
+export -f nping_early_probe
 
 # ===================== 单节点测试 =====================
 probe_target() {
@@ -3127,12 +3344,12 @@ probe_target() {
     tcp_seq=$(nping_random_seq)
     current_nping_args+=(-g "$source_port" --seq "$tcp_seq")
     if [ "$packet_size" -eq 0 ]; then
-      if raw=$(nping "${current_nping_args[@]}" -c 1 "$ip" 2>&1); then
+      if raw=$(nping_early_probe "${current_nping_args[@]}" -c 1 "$ip" 2>&1); then
         nping_rc=0
       else
         nping_rc=$?
       fi
-    elif raw=$(nping "${current_nping_args[@]}" --data-length "$payload_size" -c 1 "$ip" 2>&1); then
+    elif raw=$(nping_early_probe "${current_nping_args[@]}" --data-length "$payload_size" -c 1 "$ip" 2>&1); then
       nping_rc=0
     else
       nping_rc=$?
@@ -3140,7 +3357,7 @@ probe_target() {
 
     one_sent=$(printf "%s\n" "$raw" | sed -nE 's/.*sent:[[:space:]]*([0-9]+).*/\1/p' | head -1)
     one_rcvd=$(printf "%s\n" "$raw" | sed -nE 's/.*Rcvd:[[:space:]]*([0-9]+).*/\1/p' | head -1)
-    if [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ] && one_rtt=$(nping_matching_min_rtt "$raw"); then
+    if [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ] && one_rtt=$(nping_matching_min_rtt "$raw" "$tcp_seq" "$payload_size"); then
       one_rcvd=1
     elif [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ]; then
       if [ "$DEBUG_MODE" -eq 1 ]; then
@@ -3167,19 +3384,19 @@ probe_target() {
         tcp_seq=$(nping_random_seq)
         local -a current_l2_nping_args=("${nping_l2_args[@]}" -g "$source_port" --seq "$tcp_seq")
         if [ "$packet_size" -eq 0 ]; then
-          if raw=$(nping "${current_l2_nping_args[@]}" -c 1 "$ip" 2>&1); then
+          if raw=$(nping_early_probe "${current_l2_nping_args[@]}" -c 1 "$ip" 2>&1); then
             nping_rc=0
           else
             nping_rc=$?
           fi
-        elif raw=$(nping "${current_l2_nping_args[@]}" --data-length "$payload_size" -c 1 "$ip" 2>&1); then
+        elif raw=$(nping_early_probe "${current_l2_nping_args[@]}" --data-length "$payload_size" -c 1 "$ip" 2>&1); then
           nping_rc=0
         else
           nping_rc=$?
         fi
         one_sent=$(printf "%s\n" "$raw" | sed -nE 's/.*sent:[[:space:]]*([0-9]+).*/\1/p' | head -1)
         one_rcvd=$(printf "%s\n" "$raw" | sed -nE 's/.*Rcvd:[[:space:]]*([0-9]+).*/\1/p' | head -1)
-        if [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ] && one_rtt=$(nping_matching_min_rtt "$raw"); then
+        if [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ] && one_rtt=$(nping_matching_min_rtt "$raw" "$tcp_seq" "$payload_size"); then
           one_rcvd=1
         elif [[ "$one_rcvd" =~ ^[0-9]+$ ]] && [ "$one_rcvd" -gt 0 ]; then
           if [ "$DEBUG_MODE" -eq 1 ]; then
@@ -3617,10 +3834,19 @@ international_latency_test_one() {
   local idx="$1" family="$2" direction="$3" row_key="$4" region="$5" label="$6" host="$7" base_port="${8:-5201}" v6_base_port="${9:-}"
   local fallback_host="${10:-}" fallback_base_port="${11:-}"
   local fallback_v6_host="${12:-}" fallback_v6_base_port="${13:-}"
+  local deadline="${14:-}" primary_deadline remaining attempt_timeout refused_count=0 error_lower
   local outfile="${RESULT_DIR}/international_latency_${family}_${direction}_${idx}"
   local ip="" port="" json err_file rtt_us tcp_rtt_ms latency="-" retransmits="-" candidate_retransmits="" status="FAIL"
   local first_port last_port attempt=0 error_reason="" iperf_pid
   local -a iperf_direction_args=()
+
+  [[ "$deadline" =~ ^[0-9]+$ ]] || deadline=$((SECONDS + INTERNATIONAL_IPERF_BUDGET_SECONDS))
+  primary_deadline="$deadline"
+  # Reserve part of the shared budget for a configured fallback host.
+  if { [ "$family" = "4" ] && [ -n "$fallback_host" ]; } ||
+     { [ "$family" = "6" ] && [ -n "$fallback_v6_host" ]; }; then
+    primary_deadline=$((deadline - INTERNATIONAL_IPERF_BUDGET_SECONDS / 3))
+  fi
 
   [[ "$base_port" =~ ^[0-9]+$ ]] || base_port=5201
   if [ "$direction" = "download" ]; then
@@ -3639,12 +3865,12 @@ international_latency_test_one() {
     ip=$(resolve_first_public_ipv6 "$host" || true)
   fi
   if [ -z "$ip" ]; then
-    if [ "$family" = "4" ] && [ -n "$fallback_host" ]; then
-      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}"
+    if [ "$family" = "4" ] && [ -n "$fallback_host" ] && [ "$SECONDS" -lt "$deadline" ]; then
+      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}" "" "" "" "" "" "$deadline"
       return
     fi
-    if [ "$family" = "6" ] && [ -n "$fallback_v6_host" ]; then
-      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port"
+    if [ "$family" = "6" ] && [ -n "$fallback_v6_host" ] && [ "$SECONDS" -lt "$deadline" ]; then
+      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port" "" "" "" "" "$deadline"
       return
     fi
     printf 'SKIP|%s|%s|%s|%s|%s|%s||-|-\n' "$family" "$direction" "$row_key" "$region" "$label" "$host" > "$outfile"
@@ -3668,6 +3894,10 @@ international_latency_test_one() {
   last_port=$((first_port + 4))
   attempt=0
   while [ "$attempt" -lt "$INTERNATIONAL_IPERF_MAX_ATTEMPTS" ]; do
+    remaining=$((primary_deadline - SECONDS))
+    if [ "$remaining" -le 0 ]; then error_reason="time-budget-exhausted"; break; fi
+    attempt_timeout=15
+    [ "$remaining" -ge "$attempt_timeout" ] || attempt_timeout="$remaining"
     attempt=$((attempt + 1))
     port=$((first_port + ( (attempt - 1) % 5 )))
     json=$(mktemp "${RESULT_DIR}/iperf3.XXXXXX.json")
@@ -3676,7 +3906,7 @@ international_latency_test_one() {
     candidate_retransmits=""
     if [ "${direction}" = "download" ] && command -v ss >/dev/null 2>&1; then
       if command -v timeout >/dev/null 2>&1; then
-        timeout 15 iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+        timeout -k 1 "$attempt_timeout" iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
           -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
           -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
           > "$json" 2> "$err_file" &
@@ -3695,7 +3925,7 @@ international_latency_test_one() {
       wait "${iperf_pid}" || true
     else
       if command -v timeout >/dev/null 2>&1; then
-        timeout 15 iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+        timeout -k 1 "$attempt_timeout" iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
           -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
           -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
           > "$json" 2> "$err_file" || true
@@ -3742,14 +3972,22 @@ international_latency_test_one() {
       error_reason="${error_reason:-no-rtt}"
     fi
     rm -f -- "$json" "$err_file"
+    error_lower=${error_reason,,}
+    case "$error_lower" in
+      *"network is unreachable"*|*"no route to host"*|*"cannot assign requested address"*) break ;;
+      *"connection refused"*) refused_count=$((refused_count + 1)) ;;
+      *) refused_count=0 ;;
+    esac
+    # Try each of the five ports once before stopping on repeated refusal.
+    [ "$refused_count" -lt 5 ] || break
     [ "$attempt" -lt "$INTERNATIONAL_IPERF_MAX_ATTEMPTS" ] || break
   done
-  if [ "$status" != "OK" ] && [ "$family" = "4" ] && [ -n "$fallback_host" ]; then
-    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}"
+  if [ "$status" != "OK" ] && [ "$family" = "4" ] && [ -n "$fallback_host" ] && [ "$SECONDS" -lt "$deadline" ]; then
+    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}" "" "" "" "" "" "$deadline"
     return
   fi
-  if [ "$status" != "OK" ] && [ "$family" = "6" ] && [ -n "$fallback_v6_host" ]; then
-    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port"
+  if [ "$status" != "OK" ] && [ "$family" = "6" ] && [ -n "$fallback_v6_host" ] && [ "$SECONDS" -lt "$deadline" ]; then
+    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port" "" "" "" "" "$deadline"
     return
   fi
   if [ "$DEBUG_MODE" -eq 1 ]; then
@@ -3762,7 +4000,7 @@ international_latency_test_one() {
 }
 
 run_international_tests() {
-  local idx=0 launched=0 entry name provider domain path category total latency_expected=0 dc_id dc_ipv4 dc_ipv6 dc_port4 dc_port6 target_ip target_port
+  local idx=0 entry name provider domain path category total dc_id dc_ipv4 dc_ipv6 dc_port4 dc_port6 target_ip target_port
   local row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port family direction
   local -a latency_families=()
   refresh_international_telegram_targets || true
@@ -3779,19 +4017,11 @@ run_international_tests() {
       for entry in "${INTERNATIONAL_IPERF_TARGETS[@]}"; do
         IFS='|' read -r row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port <<< "$entry"
         idx=$((idx + 1))
-        while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
-          show_progress
-          sleep 0.2
-        done
+        wait_for_worker_slot
         international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$host" "$port" "$v6_port" "$fallback_host" "$fallback_port" "$fallback_v6_host" "$fallback_v6_port" &
-        launched=$((launched + 1))
         show_progress
       done
-      latency_expected=$((latency_expected + ${#INTERNATIONAL_IPERF_TARGETS[@]}))
-      while [ "$(count_international_progress)" -lt "$latency_expected" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_workers
     done
   done
 
@@ -3802,12 +4032,8 @@ run_international_tests() {
   for entry in "${INTERNATIONAL_SITE_TARGETS[@]}"; do
     IFS='|' read -r name domain path <<< "$entry"
     idx=$((idx + 1))
-    while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
-      show_progress
-      sleep 0.2
-    done
+    wait_for_worker_slot
     international_test_one "$idx" "$category" "$name" "Website" "$domain" "${path:-}" &
-    launched=$((launched + 1))
     show_progress
   done
 
@@ -3815,12 +4041,8 @@ run_international_tests() {
   for entry in "${INTERNATIONAL_CDN_TARGETS[@]}"; do
       IFS='|' read -r name provider domain path <<< "$entry"
       idx=$((idx + 1))
-      while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot
       international_test_one "$idx" "$category" "$name" "$provider" "$domain" "${path:-}" &
-      launched=$((launched + 1))
       show_progress
   done
 
@@ -3835,22 +4057,15 @@ run_international_tests() {
         target_port="$dc_port6"
       fi
       idx=$((idx + 1))
-      while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot
       international_telegram_dc_test_one "$idx" "$family" "$dc_id" "$target_ip" "$target_port" &
-      launched=$((launched + 1))
       show_progress
     done
   done
 
-  while [ "$(count_international_progress)" -lt "$total" ]; do
-    show_progress
-    sleep 0.2
-  done
-  wait
-  show_progress
+  wait_for_workers
+  check_worker_results "$(count_international_progress)" "$total" 国际互联
+  show_progress 1
 }
 
 append_international_csv() {
@@ -4853,6 +5068,11 @@ speedtest_retrans_trace_start() {
   [ "${SPEEDTEST_RETRANS_TRACE_ENABLED:-1}" = "1" ] || return 1
   [ "${SPEEDTEST_RETRANS_TRACE_DISABLED:-0}" -eq 0 ] || return 1
   command -v bpftrace >/dev/null 2>&1 || return 1
+  # LLVM/BTF compilation can exhaust a small VPS even with only one worker.
+  # TCP_INFO/ss remains available for retransmission measurement.
+  local total available
+  read -r total available < <(detect_memory_mb)
+  [ "$available" -ge 256 ] || return 1
   program=$(speedtest_retrans_trace_program "$SPEEDTEST_RETRANS_TRACE_SCRIPT" 2>/dev/null || true)
   if [ -n "$program" ] && speedtest_retrans_trace_launch "$output_file" "$program" 1; then
     SPEEDTEST_RETRANS_TRACE_KEY="seq"
@@ -6491,7 +6711,7 @@ wait_speedtest_background() {
   [ -n "${SPEEDTEST_BACKGROUND_PID:-}" ] || return 0
   while kill -0 "$SPEEDTEST_BACKGROUND_PID" 2>/dev/null; do
     if [ "${MULTI_PROGRESS_MODE:-0}" -eq 1 ]; then
-      show_all_progress
+      show_progress
     else
       progress=$(cat "$SPEEDTEST_PROGRESS_FILE" 2>/dev/null || true)
       done=${progress%%/*}
@@ -6966,10 +7186,7 @@ main() {
         port=${port:-80}
         province_selected "$prov" || continue
         idx=$((idx + 1))
-        while [ $((idx - $(count_results))) -gt "$PARALLEL" ]; do
-          show_progress
-          sleep 0.2
-        done
+        wait_for_worker_slot
         test_one "cdn${family}" "$family" "$prov" "$isp" "$host" "$idx" "$fixed_ip" "$port" "$backup_host" "$backup_ip" "${backup_port:-80}" &
         show_progress
       done < <(print_cdn_entries "$family")
@@ -6980,10 +7197,7 @@ main() {
       port=${port:-80}
       province_selected "$prov" || continue
       idx=$((idx + 1))
-      while [ $((idx - $(count_results))) -gt "$PARALLEL" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot
       test_large_one "large4" 4 "$prov" "$isp" "$host" "$idx" "$fixed_ip" "$port" "$backup_host" "$backup_ip" "${backup_port:-80}" &
       show_progress
     done < <(print_cdn_entries 4)
@@ -6993,10 +7207,7 @@ main() {
       port=${port:-80}
       province_selected "$prov" || continue
       idx=$((idx + 1))
-      while [ $((idx - $(count_results))) -gt "$PARALLEL" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot
       test_one "cernet" 4 "$prov" "教育网" "$host" "$idx" "$fixed_ip" "$port" "$backup_host" "$backup_ip" "${backup_port:-443}" &
       show_progress
     done < <(print_cernet_entries)
@@ -7006,18 +7217,13 @@ main() {
       port=${port:-80}
       province_selected "$prov" || continue
       idx=$((idx + 1))
-      while [ $((idx - $(count_results))) -gt "$PARALLEL" ]; do
-        show_progress
-        sleep 0.2
-      done
+      wait_for_worker_slot
       test_one "cernet2" 6 "$prov" "教育网" "$host" "$idx" "$fixed_ip" "$port" "$backup_host" "$backup_ip" "${backup_port:-443}" &
       show_progress
     done < <(print_cernet2_entries)
   fi
-  while [ $((idx - $(count_results))) -gt 0 ]; do
-    show_progress
-    sleep 0.2
-  done
+  wait_for_workers
+  check_worker_results "$(count_results)" "$idx" 延迟重传
   show_progress
 
   if [ "$large_packet_enabled" -eq 1 ] && [ "$large_packet_probe_enabled" -eq 0 ]; then
@@ -7036,7 +7242,7 @@ main() {
     start_speedtest_background 0 0
     wait_speedtest_background
   fi
-  show_progress
+  show_progress 1
   printf '\n'
 
   # 收集结果并写入 CSV

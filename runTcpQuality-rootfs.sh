@@ -328,8 +328,8 @@ persist_guest_outputs() {
   [ -n "${GUEST_TMP_HOST:-}" ] && [ -d "$GUEST_TMP_HOST" ] || return 0
   mkdir -p "$OUTPUT_DIR" || return 0
 
-  for artifact in "$GUEST_TMP_HOST"/*.csv "$GUEST_TMP_HOST"/*.tar.gz "$GUEST_TMP_HOST"/*.log; do
-    [ -f "$artifact" ] || continue
+  for artifact in "$GUEST_TMP_HOST"/*.csv "$GUEST_TMP_HOST"/*.tar.gz "$GUEST_TMP_HOST"/*.log "$GUEST_TMP_HOST"/tcpquality-results.*; do
+    [ -f "$artifact" ] || [ -d "$artifact" ] || continue
     base=$(basename -- "$artifact")
     destination="$OUTPUT_DIR/$base"
     if [ -e "$destination" ]; then
@@ -1211,6 +1211,7 @@ for env_name in \
   TCPQUALITY_TCP_INFO TCPQUALITY_TCP_INFO_PRELOAD TCPQUALITY_RETRANS_TRACE \
   TCPQUALITY_RETRANS_TRACE_SCRIPT TCPQUALITY_RETRANS_TRACE_FALLBACK_SCRIPT \
   TCPQUALITY_BPFTRACE_BTF \
+  TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS \
   HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY \
   http_proxy https_proxy no_proxy all_proxy; do
   if [ "${!env_name+x}" = x ]; then
