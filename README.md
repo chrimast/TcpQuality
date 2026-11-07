@@ -56,19 +56,15 @@ curl -fsSL https://tcpquality.ibsgss.uk/run | env TERM=xterm bash
 - `--province CODE`：仅检测指定省份，可重复；也支持 `-bj`、`-sh`、`-gd` 等省份简写。
 - `--debug`：保留临时文件并输出调试信息。
 
+普通三网测试会使用同一批节点额外识别 UDP 回程线路，并在终端和在线报告的“UDP回程”中显示 IPv4/IPv6 线路；不探测 UDP 延迟或丢包率。UDP 线路识别会增加测试时间，中间节点不响应时线路可能显示 `Hidden`。
+
+运行 v1beta：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/ibsgss/TcpQuality/v1beta/runTcpQuality.sh)
+```
+
 国际节点的每个 iPerf 测试默认最多重试 10 次，主节点和备用节点共用 45 秒尝试预算；连续 5 个端口拒绝连接或网络不可达时提前结束当前节点。可通过 `TCPQUALITY_INTERNATIONAL_IPERF_BUDGET_SECONDS` 设置 1–600 秒。DNS 解析耗时可能额外超出预算；没有 `timeout` 命令时，单次 iPerf 运行可能超过剩余预算。缩短预算可能使较慢或临时繁忙的节点显示失败。
-
-## 低内存机器
-
-启动和最终报告会显示实际采用的并行节点数；仅运行单线程测速时显示 1。
-
-并发预算同时考虑物理可用内存和当前进程的 cgroup v1/v2 内存限制（包括可见的父级限制），不使用 swap 扩大并发。预留 64 MiB 后，每个节点预算 16 MiB，向下取整，范围为 1–31；128 MiB 环境通常运行 2–3 个并行节点。`-p 1` 可指定串行测试。可用内存不足 256 MiB 时跳过 bpftrace 编译，继续使用 TCP_INFO/ss 测量重传。
-
-普通异常退出会保留 `/tmp/tcpquality-results.*` 中的原始中间结果；rootfs 模式会将其移到输出目录（默认宿主机 `/tmp`）。这些文件用于排查，不支持断点续测。SSH 连接不稳定时，可在 `tmux` 或 `nohup` 中运行。
-
-## 报告上传排查
-
-报告上传失败时会显示 curl 退出码或 HTTP 状态码、可用的错误原因及本地 CSV 路径。上传失败不会删除已生成的 CSV。`--debug` 还会保存接口响应和 curl 错误，便于区分连接超时、TLS 问题和服务端错误。
 
 ## 许可证
 
